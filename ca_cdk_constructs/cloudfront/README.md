@@ -1,0 +1,229 @@
+# CloudFrontDistribution
+
+A CloudFront distribution with CA's default hardening applied: TLS 1.3 only, SNI, HTTP/2
+and HTTP/3, IPv6, price class 100, and access logging on by default.
+
+It works in one of two modes: pass `default_behavior` to front an origin you already have,
+or `alb_origin` to have the construct build an internal load balancer and serve from that.
+
+## Reference
+
+### `CloudFrontDistribution`
+
+| Argument | Type | Default | Description | Validation |
+| --- | --- | --- | --- | --- |
+| `scope` | `Construct` | required | Usually `self`. | The stack must be environment-specific. A token region raises at synth. |
+| `id` | `str` | required | Construct id. | — |
+| `env` | `"dev" \| "pre" \| "prod"` | required | First segment of every resource name. | Type checker only. |
+| `namespace` | `str` | required | Last segment of every resource name. Must be unique per account and region. | `^[a-z0-9][a-z0-9-]{0,16}[a-z0-9]$`, i.e. 2 to 18 characters. Raises at synth. |
+| `certificate` | `ICertificate` | required | The viewer certificate. | Must be issued in us-east-1. Raises at synth, unless the ARN is an unresolved token. |
+| `domain_name` | `str` | required | The alias to serve. In ALB mode also the name CloudFront presents to the load balancer. | Not checked here. CloudFront rejects it at deploy if `certificate` does not cover it. |
+| `default_behavior` | `BehaviorOptions \| None` | `None` | The default behaviour, including the origin. | Mutually exclusive with `alb_origin`, and one of the two is required. Raises at synth. |
+| `alb_origin` | `AlbOriginProps \| None` | `None` | Build an internal ALB and serve from it. | As above, and requires `hosted_zone`. Raises at synth. |
+| `hosted_zone` | `IHostedZone \| None` | `None` | Used to DNS-validate the certificate the construct issues for the load balancer. | Required when `alb_origin` is set, ignored otherwise. |
+| `additional_behaviors` | `dict[str, BehaviorOptions] \| None` | `None` | Path pattern to behaviour. Matched in insertion order, first match wins. | — |
+| `web_acl_id` | `str \| None` | `None` | ARN of a WAFv2 web ACL. `WafV2Builder` produces a suitable one. | Not checked here. Must be `CLOUDFRONT` scoped or CloudFormation fails at deploy. |
+| `geographic_restriction` | `bool` | `True` | Allowlist GB, JE, GG, IM and IE. | — |
+| `access_logs` | `bool` | `True` | Deliver access logs using standard logging v2. | — |
+| `log_retention_days` | `int` | `90` | Lifecycle expiry on the log bucket. | — |
+| `log_format` | `"w3c" \| "parquet"` | `"w3c"` | Output format for delivered logs. | Type checker only. Cannot be changed in place once deployed. |
+| `price_class` | `PriceClass` | `PRICE_CLASS_100` | The edge locations to serve from. | — |
+| `comment` | `str \| None` | `None` | Appended to the resource name in the console's Description column. | CDK silently truncates the combined string at 128 characters. |
+
+### `AlbOriginProps`
+
+Only used in ALB mode.
+
+| Argument | Type | Default | Description | Validation |
+| --- | --- | --- | --- | --- |
+| `vpc` | `IVpc` | required | The VPC to place the load balancer in. | — |
+| `targets` | `list[IApplicationLoadBalancerTarget]` | `[]` | What the load balancer forwards to, for example an ECS service. | — |
+| `target_port` | `int` | `80` | The port the targets listen on. | — |
+| `target_protocol` | `ApplicationProtocol` | `HTTP` | Protocol between load balancer and targets. The CloudFront hop is always HTTPS regardless. | — |
+| `health_check_path` | `str` | `"/"` | Path the load balancer polls for target health. | — |
+| `vpc_subnets` | `SubnetSelection \| None` | `None` | Where to place the load balancer. Defaults to the VPC's private subnets. | — |
+
+### Attributes
+
+| Attribute | Type | Notes |
+| --- | --- | --- |
+| `distribution` | `Distribution` | Always set. |
+| `log_bucket` | `Bucket \| None` | `None` when `access_logs=False`. |
+| `alb` | `ApplicationLoadBalancer \| None` | ALB mode only. |
+| `listener` | `ApplicationListener \| None` | ALB mode only. The HTTPS listener, for adding rules. |
+| `target_group` | `ApplicationTargetGroup \| None` | ALB mode only. |
+| `alb_security_group` | `SecurityGroup \| None` | ALB mode only. Locked to the CloudFront prefix list. |
+| `origin_certificate` | `Certificate \| None` | ALB mode only. The regional certificate the construct issues. |
+| `origin` | `IOrigin \| None` | ALB mode only. Pass to `add_behavior` to cache a path. See [Caching](#caching). |
+
+The construct also emits `DistributionId` and `DistributionDomainName` as stack outputs.
+
+## Standalone mode
+
+Pass `default_behavior` to front an origin you already have. The construct stays out of the
+way and applies the certificate, alias and hardened settings around it.
+
+```python
+from aws_cdk import Environment, Stack
+from aws_cdk.aws_certificatemanager import Certificate
+from aws_cdk.aws_cloudfront import BehaviorOptions
+from aws_cdk.aws_cloudfront_origins import S3BucketOrigin
+
+from ca_cdk_constructs.cloudfront import CloudFrontDistribution
+
+dist = CloudFrontDistribution(
+    self,
+    "Cdn",
+    env="prod",
+    namespace="casebook",
+    # Must be issued in us-east-1. See "Certificates" below.
+    certificate=Certificate.from_certificate_arn(self, "ViewerCert", cert_arn),
+    domain_name="casebook.citizensadvice.org.uk",
+    default_behavior=BehaviorOptions(origin=S3BucketOrigin.with_origin_access_control(bucket)),
+)
+
+dist.distribution  # the underlying aws_cloudfront.Distribution
+dist.log_bucket  # the access log bucket, or None when access_logs=False
+```
+
+## ALB mode
+
+Pass `alb_origin` instead and the construct builds an internal Application Load Balancer,
+issues a regional certificate for it, locks its security group to the CloudFront
+origin-facing prefix list, and wires it up as a VPC origin. The load balancer is never
+publicly reachable. CloudFront reaches it over the VPC origin service rather than the
+internet.
+
+```python
+from ca_cdk_constructs.cloudfront import AlbOriginProps, CloudFrontDistribution
+
+dist = CloudFrontDistribution(
+    self,
+    "Cdn",
+    env="prod",
+    namespace="casebook",
+    certificate=Certificate.from_certificate_arn(self, "ViewerCert", cert_arn),
+    domain_name="casebook.citizensadvice.org.uk",
+    # Needed to DNS-validate the certificate the construct issues for the load balancer.
+    hosted_zone=hosted_zone,
+    alb_origin=AlbOriginProps(vpc=vpc, targets=[ecs_service], target_port=8080),
+)
+
+dist.alb  # ApplicationLoadBalancer
+dist.listener  # ApplicationListener, for adding rules
+dist.target_group  # ApplicationTargetGroup
+dist.alb_security_group  # SecurityGroup
+dist.origin  # the VPC origin, for attaching extra cache behaviours
+```
+
+## Caching
+
+In ALB mode the default behaviour caches nothing. Every request reaches your application.
+You then opt individual paths into caching.
+
+That is the deliberate direction, and it is worth understanding before you change it. If the
+default cached and one route turned out to be user-specific, CloudFront would serve one
+person's page to another. Getting it wrong in the other direction only makes the site slow.
+The construct cannot know what sits behind your load balancer, so it takes the option whose
+failure mode is a performance problem rather than a data leak.
+
+### Adding a cached path
+
+Use `add_behavior` on the underlying distribution, passing the origin the construct built:
+
+```python
+from aws_cdk.aws_cloudfront import AllowedMethods, CachePolicy, ViewerProtocolPolicy
+
+dist = CloudFrontDistribution(
+    self, "Cdn", ..., alb_origin=AlbOriginProps(vpc=vpc, targets=[service])
+)
+
+# Rails fingerprints these filenames, so a given URL's content can never change.
+for pattern in ("/assets/*", "/packs/*"):
+    dist.distribution.add_behavior(
+        pattern,
+        dist.origin,
+        cache_policy=CachePolicy.CACHING_OPTIMIZED,
+        allowed_methods=AllowedMethods.ALLOW_GET_HEAD,
+        viewer_protocol_policy=ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        compress=True,
+    )
+```
+
+Dynamic pages still reach the application. The two static prefixes are served from the edge,
+which on a typical page is most of the requests.
+
+`add_behavior` is used rather than the `additional_behaviors` argument because every
+behaviour needs an origin, and in ALB mode the construct builds that origin itself, so it
+does not exist until after the constructor has run. `additional_behaviors` is still the
+right choice when the extra behaviour points somewhere else, an S3 bucket of precompiled
+assets for example, since you already hold that origin.
+
+## Certificates
+
+The viewer certificate is supplied by the caller and must be in us-east-1. The construct
+does not vend it, because one CloudFormation stack is one region, so vending would mean
+silently adding a second stack to your app. Either create it in a us-east-1 stack, or pass
+one that already exists with `Certificate.from_certificate_arn`. A certificate from any
+other region is rejected at synth.
+
+In ALB mode the construct does vend the load balancer's certificate, which is regional and
+therefore not subject to that constraint.
+
+## DNS
+
+The construct creates no DNS records, and it enables IPv6. You need **both** an A and an
+AAAA alias pointing at the distribution.
+
+An A-only setup looks completely fine from a desk and fails silently for anyone on an
+IPv6-only mobile network. Route 53's default negative-cache TTL is 86400, so a missing AAAA
+record can stay cached for a day after you add it.
+
+## Geographic restriction
+
+`geographic_restriction` is on by default. It allowlists GB, JE, GG, IM and IE, so viewers
+located anywhere else get a 403 instead of your content.
+
+It applies to the whole distribution. There is no way to restrict one path and not another.
+
+Set `geographic_restriction=False` to serve everywhere.
+
+## Access logging
+
+On by default, using CloudFront standard logging v2. Legacy logging is not an option at CA,
+because it requires S3 ACLs and those are blocked org-wide.
+
+Logs are delivered to a bucket the construct creates and exposes as `log_bucket`, versioned,
+SSE-S3 encrypted, public access blocked, and expiring after `log_retention_days` (90 by
+default). CloudFront never deletes log files itself, so without that expiry the bucket grows
+forever. The bucket is retained when the stack is deleted.
+
+Supplying your own bucket is not supported, because CDK cannot attach the required delivery
+policy to an imported bucket and the failure would be silent.
+
+Two things worth knowing:
+
+- `log_format` defaults to `"w3c"`, which matches the legacy CloudFront layout and costs
+  nothing extra. `"parquet"` is far cheaper to query in Athena but incurs CloudWatch
+  conversion charges. **It cannot be changed in place.** Set `access_logs=False`, deploy,
+  change the format, then deploy again.
+- Logs can take up to an hour to appear. That is normal, not a broken configuration.
+
+## Naming
+
+Every resource is named `<env>-<region-short>-<type>-<namespace>`, for example
+`prod-euw2-alb-casebook`. `namespace` is capped at 18 characters by the 32 character
+limit on load balancer names, and must be unique per account and region.
+
+The log bucket is the exception. It uses S3's account-regional namespace, so CloudFormation
+appends the account and region and the name reads `prod-s3-casebook-<account>-<region>-an`.
+
+Because the load balancer, target group and security group have explicit physical names,
+CloudFormation cannot replace them in place. Any update that requires a replacement is
+delete-then-create, which means downtime.
+
+## Requirements
+
+The stack must be environment-specific, i.e. created with
+`env=Environment(account=..., region=...)`. Resource names embed a region short code, so the
+construct cannot work with a region-agnostic stack and will raise at synth if given one.
