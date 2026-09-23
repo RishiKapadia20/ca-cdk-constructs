@@ -1,7 +1,7 @@
 # CloudFrontDistribution
 
-A CloudFront distribution with CA's default hardening applied: TLS 1.3 only, SNI, HTTP/2
-and HTTP/3, IPv6, price class 100, and access logging on by default.
+A CloudFront distribution with CA's default hardening applied: TLSv1.2_2021 minimum, SNI,
+HTTP/2 and HTTP/3, IPv6, price class 100, and access logging on by default.
 
 It works in one of two modes: pass `default_behavior` to front an origin you already have,
 or `alb_origin` to have the construct build an internal load balancer and serve from that.
@@ -17,10 +17,10 @@ or `alb_origin` to have the construct build an internal load balancer and serve 
 | `env` | `"dev" \| "pre" \| "prod"` | required | First segment of every resource name. | Type checker only. |
 | `namespace` | `str` | required | Last segment of every resource name. Must be unique per account and region. | `^[a-z0-9][a-z0-9-]{0,16}[a-z0-9]$`, i.e. 2 to 18 characters. Raises at synth. |
 | `certificate` | `ICertificate` | required | The viewer certificate. | Must be issued in us-east-1. Raises at synth, unless the ARN is an unresolved token. |
-| `domain_name` | `str` | required | The alias to serve. In ALB mode also the name CloudFront presents to the load balancer. | Not checked here. CloudFront rejects it at deploy if `certificate` does not cover it. |
+| `domain_name` | `str` | required | The service's hostname. Served as the alias unless `associate_domain_name` is `False`. In ALB mode also the name CloudFront presents to the load balancer, which it stays either way. | Not checked here. CloudFront rejects it at deploy if `certificate` does not cover it. |
+| `associate_domain_name` | `bool` | `True` | Serve `domain_name` as the distribution's alternate domain name. Set `False` for a side-by-side migration. See [Migration](#migrating-an-existing-distribution). | — |
 | `default_behavior` | `BehaviorOptions \| None` | `None` | The default behaviour, including the origin. | Mutually exclusive with `alb_origin`, and one of the two is required. Raises at synth. |
-| `alb_origin` | `AlbOriginProps \| None` | `None` | Build an internal ALB and serve from it. | As above, and requires `hosted_zone`. Raises at synth. |
-| `hosted_zone` | `IHostedZone \| None` | `None` | Used to DNS-validate the certificate the construct issues for the load balancer. | Required when `alb_origin` is set, ignored otherwise. |
+| `alb_origin` | `AlbOriginProps \| None` | `None` | Build an internal ALB and serve from it. | As above, and needs either its `certificate` or its `hosted_zone`. Raises at synth. |
 | `additional_behaviors` | `dict[str, BehaviorOptions] \| None` | `None` | Path pattern to behaviour. Matched in insertion order, first match wins. | — |
 | `web_acl_id` | `str \| None` | `None` | ARN of a WAFv2 web ACL. `WafV2Builder` produces a suitable one. | Not checked here. Must be `CLOUDFRONT` scoped or CloudFormation fails at deploy. |
 | `geographic_restriction` | `bool` | `True` | Allowlist GB, JE, GG, IM and IE. | — |
@@ -28,6 +28,7 @@ or `alb_origin` to have the construct build an internal load balancer and serve 
 | `log_retention_days` | `int` | `90` | Lifecycle expiry on the log bucket. | — |
 | `log_format` | `"w3c" \| "parquet"` | `"w3c"` | Output format for delivered logs. | Type checker only. Cannot be changed in place once deployed. |
 | `price_class` | `PriceClass` | `PRICE_CLASS_100` | The edge locations to serve from. | — |
+| `minimum_protocol_version` | `SecurityPolicyProtocol` | `TLS_V1_2_2021` | Lowest TLS version a viewer may negotiate. | — |
 | `comment` | `str \| None` | `None` | Appended to the resource name in the console's Description column. | CDK silently truncates the combined string at 128 characters. |
 
 ### `AlbOriginProps`
@@ -42,6 +43,8 @@ Only used in ALB mode.
 | `target_protocol` | `ApplicationProtocol` | `HTTP` | Protocol between load balancer and targets. The CloudFront hop is always HTTPS regardless. | — |
 | `health_check_path` | `str` | `"/"` | Path the load balancer polls for target health. | — |
 | `vpc_subnets` | `SubnetSelection \| None` | `None` | Where to place the load balancer. Defaults to the VPC's private subnets. | — |
+| `certificate` | `ICertificate \| None` | `None` | An existing regional certificate for the listener. Supply this rather than vending a second one for a domain that already has one. | Must be in the stack's own region. Raises at synth, unless the ARN is an unresolved token. Whether it covers `domain_name` cannot be checked. |
+| `hosted_zone` | `IHostedZone \| None` | `None` | Used to DNS-validate the certificate the construct issues for the load balancer. | Required unless `certificate` is supplied. Raises at synth. |
 
 ### Attributes
 
@@ -53,7 +56,7 @@ Only used in ALB mode.
 | `listener` | `ApplicationListener \| None` | ALB mode only. The HTTPS listener, for adding rules. |
 | `target_group` | `ApplicationTargetGroup \| None` | ALB mode only. |
 | `alb_security_group` | `SecurityGroup \| None` | ALB mode only. Locked to the CloudFront prefix list. |
-| `origin_certificate` | `Certificate \| None` | ALB mode only. The regional certificate the construct issues. |
+| `origin_certificate` | `ICertificate \| None` | ALB mode only. Whichever certificate ended up on the listener, yours or the one the construct issued. |
 | `origin` | `IOrigin \| None` | ALB mode only. Pass to `add_behavior` to cache a path. See [Caching](#caching). |
 
 The construct also emits `DistributionId` and `DistributionDomainName` as stack outputs.
@@ -104,9 +107,14 @@ dist = CloudFrontDistribution(
     namespace="casebook",
     certificate=Certificate.from_certificate_arn(self, "ViewerCert", cert_arn),
     domain_name="casebook.citizensadvice.org.uk",
-    # Needed to DNS-validate the certificate the construct issues for the load balancer.
-    hosted_zone=hosted_zone,
-    alb_origin=AlbOriginProps(vpc=vpc, targets=[ecs_service], target_port=8080),
+    alb_origin=AlbOriginProps(
+        vpc=vpc,
+        targets=[ecs_service],
+        target_port=8080,
+        # Needed to DNS-validate the certificate the construct issues for the load
+        # balancer. Pass `certificate=...` instead if you already have one.
+        hosted_zone=hosted_zone,
+    ),
 )
 
 dist.alb  # ApplicationLoadBalancer
@@ -135,7 +143,10 @@ Use `add_behavior` on the underlying distribution, passing the origin the constr
 from aws_cdk.aws_cloudfront import AllowedMethods, CachePolicy, ViewerProtocolPolicy
 
 dist = CloudFrontDistribution(
-    self, "Cdn", ..., alb_origin=AlbOriginProps(vpc=vpc, targets=[service])
+    self,
+    "Cdn",
+    ...,
+    alb_origin=AlbOriginProps(vpc=vpc, targets=[service], hosted_zone=hosted_zone),
 )
 
 # Rails fingerprints these filenames, so a given URL's content can never change.
@@ -167,8 +178,75 @@ silently adding a second stack to your app. Either create it in a us-east-1 stac
 one that already exists with `Certificate.from_certificate_arn`. A certificate from any
 other region is rejected at synth.
 
-In ALB mode the construct does vend the load balancer's certificate, which is regional and
-therefore not subject to that constraint.
+In ALB mode the load balancer needs its own certificate, which is regional and therefore not
+subject to that constraint. Supply one with `AlbOriginProps(certificate=...)`, or leave it
+unset and pass `hosted_zone` instead and the construct issues one.
+
+
+## Migrating an existing distribution
+
+To replace a distribution you already have, stand the new one up beside it and move the
+domain across. CloudFront will not let two distributions hold the same alternate domain
+name, so the new one is deployed without it.
+
+```python
+dist = CloudFrontDistribution(
+    self,
+    "Cdn",
+    env="prod",
+    namespace="casebook",
+    certificate=Certificate.from_certificate_arn(self, "ViewerCert", cert_arn),
+    domain_name="casebook.citizensadvice.org.uk",
+    associate_domain_name=False,
+    alb_origin=AlbOriginProps(
+        vpc=vpc,
+        targets=[ecs_service],
+        # The certificate this service already has. See "Certificates".
+        certificate=existing_regional_certificate,
+    ),
+)
+```
+
+The certificate stays attached even with no alias. That is not an oversight: AWS requires a
+covering certificate on the target of a domain move, and the move is what adds the alias.
+CDK warns about the empty domain names, which is a useful reminder rather than a problem.
+
+### The sequence
+
+The order matters, and getting it wrong takes the site down.
+
+1. **Deploy.** Test on the `DistributionDomainName` output, which is the
+   `d111....cloudfront.net` name.
+2. **Move the domain**, in two commands.
+
+   **2a. Get the ETag of the new distribution**, the one with no alias.
+
+   ```sh
+   NEW_ID=<new distribution id>
+   aws cloudfront get-distribution --id "$NEW_ID" --query ETag --output text
+   ```
+
+   **2b. Move it.** This removes the alias from the old distribution and adds it to the new
+   one:
+
+   ```sh
+   aws cloudfront update-domain-association \
+     --domain casebook.citizensadvice.org.uk \
+     --target-resource DistributionId="$NEW_ID" \
+     --if-match <the ETag from 2a>
+   ```
+
+   Traffic follows immediately, before you touch DNS, because CloudFront matches a request
+   to a distribution by `Host` header rather than by which distribution domain was resolved.
+3. **Reconcile both stacks, straight away.** Set `associate_domain_name=True` here and
+   deploy, and remove the alias from the old stack and deploy that. Both are no-ops against
+   live state. They exist only to stop CloudFormation undoing step 2.
+
+   Leave this and the next deploy of the new stack strips the alias and takes the site down,
+   while the next deploy of the old stack fails with `CNAMEAlreadyExists`. Nobody should
+   touch either stack until this step is done.
+4. **Update DNS** to the new distribution domain name. Both A and AAAA, per [DNS](#dns).
+
 
 ## DNS
 

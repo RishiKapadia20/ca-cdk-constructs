@@ -96,6 +96,17 @@ class AlbOriginProps:
         Defaults to "/".
     :param vpc_subnets: Where to place the load balancer. Defaults to the VPC's private
         subnets.
+    :param certificate: An existing regional certificate to put on the load balancer's
+        listener. Must cover the construct's `domain_name`, because that is the name
+        CloudFront presents to the load balancer, and must be issued in the stack's own
+        region. Supply this when migrating a service that already has a certificate for
+        the domain: vending a second one leaves both sharing a single ACM validation
+        record, and deleting either stack takes that record away and breaks renewal of the
+        survivor. Leave it unset and the construct issues one, which needs `hosted_zone`.
+    :param hosted_zone: Zone used to DNS-validate the certificate the construct issues for
+        the load balancer. Required unless `certificate` is supplied, unused when it is.
+        No records are created in it; ACM adds its own validation record and the caller
+        owns everything else.
     """
 
     vpc: IVpc
@@ -104,6 +115,8 @@ class AlbOriginProps:
     target_protocol: ApplicationProtocol = ApplicationProtocol.HTTP
     health_check_path: str = "/"
     vpc_subnets: SubnetSelection | None = None
+    certificate: ICertificate | None = None
+    hosted_zone: IHostedZone | None = None
 
 
 class CloudFrontDistribution(Construct):
@@ -111,7 +124,7 @@ class CloudFrontDistribution(Construct):
     A CloudFront distribution with CA's default hardening applied.
 
     The defaults are as follows:
-    - TLSv1.3_2025 minimum viewer protocol version, SNI only
+    - TLSv1.2_2021 minimum viewer protocol version, SNI only
     - HTTP/2 and HTTP/3, IPv6 enabled
     - PriceClass 100 (Europe and North America edge locations)
 
@@ -121,9 +134,10 @@ class CloudFrontDistribution(Construct):
     the way and only applies the certificate, aliases and hardened settings around it.
 
     Pass `alb_origin` instead and the construct builds an internal Application Load Balancer,
-    issues a certificate for it, locks its security group down to CloudFront, and wires it up
-    as a VPC origin. The load balancer is never publicly reachable; CloudFront reaches it
-    over the VPC origin service rather than the internet.
+    puts a certificate on it, locks its security group down to CloudFront, and wires it up
+    as a VPC origin. The certificate is one you supply or, failing that, one the construct
+    issues. The load balancer is never publicly reachable; CloudFront reaches it over the
+    VPC origin service rather than the internet.
 
     Every resource is named `<env>-<region-short>-<type>-<namespace>`, for example
     `prod-euw2-alb-casebook`. The log bucket is the one exception: it uses S3's
@@ -139,18 +153,23 @@ class CloudFrontDistribution(Construct):
     :param certificate: The viewer certificate, which must be issued in us-east-1 because
         CloudFront accepts no other region. Either create it in a us-east-1 stack, or pass
         one that already exists with `Certificate.from_certificate_arn`.
-    :param domain_name: The alias to serve, which must be covered by `certificate`. In
-        `alb_origin` mode it is also the name on the load balancer's certificate and the
-        name CloudFront presents to it.
+    :param domain_name: The service's hostname. Normally served as the distribution's
+        alternate domain name, in which case `certificate` must cover it. In `alb_origin`
+        mode it is also the name on the load balancer's certificate and the name CloudFront
+        presents to it, and it keeps that job even when `associate_domain_name` is False.
+    :param associate_domain_name: Serve `domain_name` as the distribution's alternate
+        domain name. Defaults to True. Set it False to stand a distribution up beside one
+        that already holds the domain, which CloudFront would otherwise reject, then move
+        the domain across with `aws cloudfront update-domain-association`. The certificate
+        stays attached either way, because AWS requires that on the target of a move. See
+        the README's migration section for the full sequence.
     :param default_behavior: The default behaviour, including the origin. Mutually
         exclusive with `alb_origin`.
     :param alb_origin: Details of an internal load balancer for the construct to build and
-        serve from. Mutually exclusive with `default_behavior`. Resolving the CloudFront
-        prefix list is a context lookup, so this mode only works in a stack created with
-        an explicit `env=Environment(account=..., region=...)`.
-    :param hosted_zone: Zone used to validate the load balancer's certificate. Required
-        with `alb_origin`, unused otherwise. No records are created in it; ACM adds its own
-        validation record and the caller owns everything else.
+        serve from. Mutually exclusive with `default_behavior`, and needs either its own
+        `certificate` or its own `hosted_zone`. Resolving the CloudFront prefix list is a
+        context lookup, so this mode only works in a stack created with an explicit
+        `env=Environment(account=..., region=...)`.
     :param additional_behaviors: Path pattern to behaviour mappings. Defaults to none.
     :param web_acl_id: ARN of a WAFv2 web ACL, which must be CLOUDFRONT scoped.
         `WafV2Builder` produces a suitable one. Defaults to no WAF.
@@ -174,6 +193,9 @@ class CloudFrontDistribution(Construct):
         query in Athena but incurs CloudWatch conversion charges. This cannot be changed
         once deployed without disabling access logs first.
     :param price_class: The edge locations to serve from. Defaults to PRICE_CLASS_100.
+    :param minimum_protocol_version: Lowest TLS version a viewer may negotiate. Defaults to
+        TLS_V1_2_2021, which is the AWS recommended policy and what Security Hub control
+        CloudFront.15 accepts.
     :param comment: Appended to the resource name in the CloudFront console's Description
         column, as ``<name>: <comment>``. Defaults to the resource name alone.
     """
@@ -186,9 +208,9 @@ class CloudFrontDistribution(Construct):
         namespace: str,
         certificate: ICertificate,
         domain_name: str,
+        associate_domain_name: bool = True,
         default_behavior: BehaviorOptions | None = None,
         alb_origin: AlbOriginProps | None = None,
-        hosted_zone: IHostedZone | None = None,
         additional_behaviors: dict[str, BehaviorOptions] | None = None,
         web_acl_id: str | None = None,
         geographic_restriction: bool = True,
@@ -196,6 +218,9 @@ class CloudFrontDistribution(Construct):
         log_retention_days: int = 90,
         log_format: LogFormat = "w3c",
         price_class: PriceClass = PriceClass.PRICE_CLASS_100,
+        minimum_protocol_version: SecurityPolicyProtocol = (
+            SecurityPolicyProtocol.TLS_V1_2_2021
+        ),
         comment: str | None = None,
     ) -> None:
         super().__init__(scope, id)
@@ -204,22 +229,28 @@ class CloudFrontDistribution(Construct):
         self._namespace = namespace
         self._region_short = self._resolve_region_short()
         self._validate_namespace()
-        self._validate_certificate_region(certificate)
+        self._validate_certificate_region(
+            certificate, CLOUDFRONT_HOME_REGION, "CloudFront certificates"
+        )
 
         self.alb: ApplicationLoadBalancer | None = None
         self.alb_security_group: SecurityGroup | None = None
         self.listener: ApplicationListener | None = None
         self.target_group: ApplicationTargetGroup | None = None
-        self.origin_certificate: Certificate | None = None
+        self.origin_certificate: ICertificate | None = None
         self.origin: IOrigin | None = None
 
         if alb_origin is not None and default_behavior is not None:
             raise Exception("default_behavior and alb_origin are mutually exclusive")
 
         if alb_origin is not None:
-            if hosted_zone is None:
-                raise Exception("hosted_zone is required when alb_origin is set")
-            default_behavior = self._build_alb_origin(alb_origin, domain_name, hosted_zone)
+            if alb_origin.certificate is not None:
+                self._validate_certificate_region(
+                    alb_origin.certificate,
+                    Stack.of(self).region,
+                    "Load balancer certificates",
+                )
+            default_behavior = self._build_alb_origin(alb_origin, domain_name)
 
         if default_behavior is None:
             raise Exception("Either default_behavior or alb_origin must be set")
@@ -229,7 +260,7 @@ class CloudFrontDistribution(Construct):
         self.distribution = Distribution(
             self,
             "Default",
-            domain_names=[domain_name],
+            domain_names=[domain_name] if associate_domain_name else None,
             certificate=certificate,
             default_behavior=default_behavior,
             additional_behaviors=additional_behaviors or {},
@@ -244,7 +275,7 @@ class CloudFrontDistribution(Construct):
             enabled=True,
             enable_ipv6=True,
             http_version=HttpVersion.HTTP2_AND_3,
-            minimum_protocol_version=SecurityPolicyProtocol.TLS_V1_3_2025,
+            minimum_protocol_version=minimum_protocol_version,
             ssl_support_method=SSLMethod.SNI,
         )
 
@@ -474,8 +505,25 @@ class CloudFrontDistribution(Construct):
         self,
         props: AlbOriginProps,
         domain_name: str,
-        hosted_zone: IHostedZone,
     ) -> BehaviorOptions:
+
+        if props.certificate is not None:
+            self.origin_certificate = props.certificate
+        elif props.hosted_zone is not None:
+            self.origin_certificate = Certificate(
+                self,
+                "OriginCertificate",
+                domain_name=domain_name,
+                certificate_name=self._resource_name("acm"),
+                validation=CertificateValidation.from_dns(props.hosted_zone),
+            )
+        else:
+            raise Exception(
+                "alb_origin needs either certificate, an existing regional certificate "
+                "covering domain_name, or hosted_zone, to DNS-validate one the construct "
+                "issues"
+            )
+
         self.alb_security_group = SecurityGroup(
             self,
             "AlbSecurityGroup",
@@ -491,14 +539,6 @@ class CloudFrontDistribution(Construct):
             ),
             Port.HTTPS,
             "CloudFront origin-facing ranges",
-        )
-
-        self.origin_certificate = Certificate(
-            self,
-            "OriginCertificate",
-            domain_name=domain_name,
-            certificate_name=self._resource_name("acm"),
-            validation=CertificateValidation.from_dns(hosted_zone),
         )
 
         self.alb = ApplicationLoadBalancer(
@@ -541,7 +581,7 @@ class CloudFrontDistribution(Construct):
             origin=self.origin,
             viewer_protocol_policy=ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
             allowed_methods=AllowedMethods.ALLOW_ALL,
-            origin_request_policy=OriginRequestPolicy.ALL_VIEWER,
+            origin_request_policy=OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
             # Caching is off because the construct cannot know whether what sits behind the
             # load balancer is safe to cache. Opt in per path with additional_behaviors.
             cache_policy=CachePolicy.CACHING_DISABLED,
@@ -549,19 +589,22 @@ class CloudFrontDistribution(Construct):
         )
 
     @staticmethod
-    def _validate_certificate_region(certificate: ICertificate) -> None:
+    def _validate_certificate_region(
+        certificate: ICertificate, expected_region: str, what: str
+    ) -> None:
         """Fail at synth rather than at deploy when given a certificate from the wrong region.
 
         Imported certificates can carry a token ARN, in which case the region is
         unknowable until deploy time and CloudFormation has to be the one to complain.
+        Whether the certificate covers the domain is not knowable here at all, because
+        ICertificate exposes nothing but the ARN.
         """
         arn = certificate.certificate_arn
         if Token.is_unresolved(arn):
             return
 
         region = Arn.split(arn, ArnFormat.SLASH_RESOURCE_NAME).region
-        if region != CLOUDFRONT_HOME_REGION:
+        if region != expected_region:
             raise Exception(
-                f"CloudFront certificates must be issued in {CLOUDFRONT_HOME_REGION}, "
-                f"but {arn} is in {region}"
+                f"{what} must be issued in {expected_region}, but {arn} is in {region}"
             )

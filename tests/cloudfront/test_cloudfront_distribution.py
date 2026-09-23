@@ -10,10 +10,13 @@ import pytest
 from aws_cdk import App, Environment, Stack
 from aws_cdk.assertions import Match, Template
 from aws_cdk.aws_certificatemanager import Certificate
-from aws_cdk.aws_cloudfront import BehaviorOptions
+from aws_cdk.aws_cloudfront import (
+    BehaviorOptions,
+    SecurityPolicyProtocol,
+)
 from aws_cdk.aws_cloudfront_origins import HttpOrigin
 from aws_cdk.aws_ec2 import SubnetSelection, SubnetType, Vpc
-from aws_cdk.aws_route53 import HostedZone
+from aws_cdk.aws_route53 import HostedZone, IHostedZone
 
 from ca_cdk_constructs.cloudfront import AlbOriginProps, CloudFrontDistribution
 
@@ -23,11 +26,21 @@ DOMAIN_NAME = "service.example.org"
 VIEWER_CERT_ARN = (
     f"arn:aws:acm:us-east-1:{ACCOUNT}:certificate/11111111-2222-3333-4444-555555555555"
 )
+ORIGIN_CERT_ARN = (
+    f"arn:aws:acm:{REGION}:{ACCOUNT}:certificate/66666666-7777-8888-9999-000000000000"
+)
 
 
 def build_stack() -> Stack:
     """An environment-specific stack in eu-west-2, which the construct requires."""
     return Stack(App(), "TestStack", env=Environment(account=ACCOUNT, region=REGION))
+
+
+def build_hosted_zone(stack: Stack, id: str = "Zone") -> IHostedZone:
+    """The zone ALB mode uses to DNS-validate the certificate it issues."""
+    return HostedZone.from_hosted_zone_attributes(
+        stack, id, hosted_zone_id="Z0123456789ABCDEFGHIJ", zone_name="example.org"
+    )
 
 
 def build_distribution(stack: Stack, **kwargs) -> CloudFrontDistribution:
@@ -60,11 +73,10 @@ def alb_mode() -> Template:
     build_distribution(
         stack,
         default_behavior=None,
-        hosted_zone=HostedZone.from_hosted_zone_attributes(
-            stack, "Zone", hosted_zone_id="Z0123456789ABCDEFGHIJ", zone_name="example.org"
-        ),
         alb_origin=AlbOriginProps(
-            vpc=vpc, vpc_subnets=SubnetSelection(subnet_type=SubnetType.PUBLIC)
+            vpc=vpc,
+            vpc_subnets=SubnetSelection(subnet_type=SubnetType.PUBLIC),
+            hosted_zone=build_hosted_zone(stack),
         ),
     )
     return Template.from_stack(stack)
@@ -73,12 +85,34 @@ def alb_mode() -> Template:
 # --- Hardened defaults -------------------------------------------------------------
 
 
-def test_minimum_protocol_version_is_tls_1_3(standalone):
-    """Viewers that cannot negotiate TLS 1.3 should be refused, not quietly downgraded.
+def test_minimum_protocol_version_defaults_to_tls_1_2(standalone):
+    """The AWS recommended policy, and what Security Hub CloudFront.15 accepts.
 
-    Asserts the viewer certificate's minimum protocol version renders as TLSv1.3_2025.
+    Asserts the viewer certificate's minimum protocol version renders as TLSv1.2_2021.
     """
     standalone.has_resource_properties(
+        "AWS::CloudFront::Distribution",
+        {
+            "DistributionConfig": Match.object_like(
+                {
+                    "ViewerCertificate": Match.object_like(
+                        {"MinimumProtocolVersion": "TLSv1.2_2021"}
+                    )
+                }
+            )
+        },
+    )
+
+
+def test_minimum_protocol_version_can_be_raised():
+    """Services that control their clients can refuse anything below TLS 1.3.
+
+    Asserts the supplied policy reaches the template.
+    """
+    stack = build_stack()
+    build_distribution(stack, minimum_protocol_version=SecurityPolicyProtocol.TLS_V1_3_2025)
+
+    Template.from_stack(stack).has_resource_properties(
         "AWS::CloudFront::Distribution",
         {
             "DistributionConfig": Match.object_like(
@@ -254,10 +288,7 @@ def test_alb_origin_is_exposed_for_extra_cache_behaviours():
     dist = build_distribution(
         stack,
         default_behavior=None,
-        hosted_zone=HostedZone.from_hosted_zone_attributes(
-            stack, "Zone", hosted_zone_id="Z0123456789ABCDEFGHIJ", zone_name="example.org"
-        ),
-        alb_origin=AlbOriginProps(vpc=vpc),
+        alb_origin=AlbOriginProps(vpc=vpc, hosted_zone=build_hosted_zone(stack)),
     )
     assert dist.origin is not None
     dist.distribution.add_behavior("/assets/*", dist.origin)
@@ -391,6 +422,90 @@ def test_access_logs_can_be_turned_off():
     template.resource_count_is("Custom::AWS", 0)
 
 
+# --- Migration mode ----------------------------------------------------------------
+
+
+def test_domain_name_is_served_as_an_alias_by_default(standalone):
+    """The common case is unchanged by migration support.
+
+    Asserts the domain name renders as an alternate domain name.
+    """
+    standalone.has_resource_properties(
+        "AWS::CloudFront::Distribution",
+        {"DistributionConfig": Match.object_like({"Aliases": [DOMAIN_NAME]})},
+    )
+
+
+def test_migration_mode_omits_the_alias_but_keeps_the_certificate():
+    """CloudFront refuses to let two distributions hold one alias, so a replacement has to
+    be built without it. The certificate still has to be attached, because AWS requires that
+    on the target of an `update-domain-association` move and the move is what adds the alias.
+
+    Asserts no Aliases key at all, while the ACM certificate and the TLS policy stay put.
+    """
+    stack = build_stack()
+    build_distribution(stack, associate_domain_name=False)
+
+    Template.from_stack(stack).has_resource_properties(
+        "AWS::CloudFront::Distribution",
+        {
+            "DistributionConfig": Match.object_like(
+                {
+                    # Absent, not empty: an empty list still renders the key.
+                    "Aliases": Match.absent(),
+                    "ViewerCertificate": Match.object_like(
+                        {
+                            "AcmCertificateArn": VIEWER_CERT_ARN,
+                            "MinimumProtocolVersion": "TLSv1.2_2021",
+                        }
+                    ),
+                }
+            )
+        },
+    )
+
+
+def test_supplied_origin_certificate_is_used_instead_of_vending_one():
+    """A team migrating already holds a certificate for the domain. Vending a second leaves
+    both sharing one ACM validation record, so deleting either stack breaks the survivor's
+    renewal.
+
+    Asserts nothing is vended, and that the supplied certificate reaches the listener.
+    """
+    stack = build_stack()
+    vpc = Vpc(stack, "Vpc", max_azs=2, nat_gateways=0)
+    origin_cert = Certificate.from_certificate_arn(stack, "OriginCert", ORIGIN_CERT_ARN)
+    dist = build_distribution(
+        stack,
+        default_behavior=None,
+        alb_origin=AlbOriginProps(vpc=vpc, certificate=origin_cert),
+    )
+
+    assert dist.origin_certificate is origin_cert
+    template = Template.from_stack(stack)
+    template.resource_count_is("AWS::CertificateManager::Certificate", 0)
+    template.has_resource_properties(
+        "AWS::ElasticLoadBalancingV2::Listener",
+        Match.object_like({"Certificates": [{"CertificateArn": ORIGIN_CERT_ARN}]}),
+    )
+
+
+def test_origin_certificate_is_vended_when_none_is_supplied(alb_mode):
+    """The original behaviour, which nothing asserted before.
+
+    Asserts exactly one certificate is issued for the domain and lands on the listener.
+    """
+    alb_mode.resource_count_is("AWS::CertificateManager::Certificate", 1)
+    alb_mode.has_resource_properties(
+        "AWS::CertificateManager::Certificate",
+        Match.object_like({"DomainName": DOMAIN_NAME, "ValidationMethod": "DNS"}),
+    )
+    alb_mode.has_resource_properties(
+        "AWS::ElasticLoadBalancingV2::Listener",
+        Match.object_like({"Certificates": [Match.any_value()]}),
+    )
+
+
 # --- Validation --------------------------------------------------------------------
 
 
@@ -460,17 +575,37 @@ def test_one_of_default_behavior_or_alb_origin_is_required():
         build_distribution(stack, default_behavior=None, alb_origin=None)
 
 
-def test_alb_origin_requires_a_hosted_zone():
-    """ALB mode issues a certificate for the load balancer, which the construct has to
-    DNS-validate, and that needs the zone.
+def test_alb_origin_requires_a_certificate_or_a_hosted_zone():
+    """The load balancer's listener needs a certificate, which is either one the caller
+    supplies or one the construct issues, and issuing needs a zone to validate against.
 
-    Asserts that choosing ALB mode without a hosted zone raises.
+    Asserts that choosing ALB mode with neither raises.
     """
     stack = build_stack()
-    with pytest.raises(Exception, match="hosted_zone is required"):
+    with pytest.raises(Exception, match="alb_origin needs either certificate"):
         build_distribution(
             stack,
             default_behavior=None,
             alb_origin=AlbOriginProps(vpc=Vpc(stack, "Vpc")),
-            hosted_zone=None,
+        )
+
+
+def test_origin_certificate_outside_the_stack_region_is_rejected():
+    """The viewer certificate must be in us-east-1 and the load balancer's must be regional,
+    so passing the same certificate to both is an easy mistake that otherwise surfaces
+    several minutes into a deploy as a CertificateNotFound from ELB.
+
+    Asserts construction raises, and that the message names the stack's region.
+    """
+    stack = build_stack()
+    with pytest.raises(Exception, match=f"must be issued in {REGION}"):
+        build_distribution(
+            stack,
+            default_behavior=None,
+            alb_origin=AlbOriginProps(
+                vpc=Vpc(stack, "Vpc"),
+                certificate=Certificate.from_certificate_arn(
+                    stack, "WrongRegionOriginCert", VIEWER_CERT_ARN
+                ),
+            ),
         )
