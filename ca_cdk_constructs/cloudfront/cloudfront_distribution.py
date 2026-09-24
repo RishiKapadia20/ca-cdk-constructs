@@ -171,8 +171,12 @@ class CloudFrontDistribution(Construct):
         context lookup, so this mode only works in a stack created with an explicit
         `env=Environment(account=..., region=...)`.
     :param additional_behaviors: Path pattern to behaviour mappings. Defaults to none.
-    :param web_acl_id: ARN of a WAFv2 web ACL, which must be CLOUDFRONT scoped.
-        `WafV2Builder` produces a suitable one. Defaults to no WAF.
+    :param web_acl_id: Unique identifier that specifies the AWS WAF web ACL to associate
+        with this CloudFront distribution. To specify a web ACL created using the latest
+        version of AWS WAF, use the ACL ARN, for example
+        `arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/473e64fd-f30b-4765-81a0-62ad96dd167a`.
+        To specify a web ACL created using AWS WAF Classic, use the ACL ID, for example
+        `473e64fd-f30b-4765-81a0-62ad96dd167a`. Defaults to no WAF.
     :param geographic_restriction: Serve only to the British Isles and Ireland
         (GB, JE, GG, IM, IE). Defaults to True. Three things to know before leaving this on
         for public content:

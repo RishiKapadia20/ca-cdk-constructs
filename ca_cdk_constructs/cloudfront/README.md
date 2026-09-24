@@ -22,7 +22,7 @@ or `alb_origin` to have the construct build an internal load balancer and serve 
 | `default_behavior` | `BehaviorOptions \| None` | `None` | The default behaviour, including the origin. | Mutually exclusive with `alb_origin`, and one of the two is required. Raises at synth. |
 | `alb_origin` | `AlbOriginProps \| None` | `None` | Build an internal ALB and serve from it. | As above, and needs either its `certificate` or its `hosted_zone`. Raises at synth. |
 | `additional_behaviors` | `dict[str, BehaviorOptions] \| None` | `None` | Path pattern to behaviour. Matched in insertion order, first match wins. | — |
-| `web_acl_id` | `str \| None` | `None` | ARN of a WAFv2 web ACL. `WafV2Builder` produces a suitable one. | Not checked here. Must be `CLOUDFRONT` scoped or CloudFormation fails at deploy. |
+| `web_acl_id` | `str \| None` | `None` | Unique identifier that specifies the AWS WAF web ACL to associate with this distribution. The ACL ARN for AWS WAFv2, or the ACL ID for AWS WAF Classic. | Not checked here. Must be `CLOUDFRONT` scoped or CloudFormation fails at deploy. |
 | `geographic_restriction` | `bool` | `True` | Allowlist GB, JE, GG, IM and IE. | — |
 | `access_logs` | `bool` | `True` | Deliver access logs using standard logging v2. | — |
 | `log_retention_days` | `int` | `90` | Lifecycle expiry on the log bucket. | — |
