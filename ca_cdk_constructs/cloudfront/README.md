@@ -26,7 +26,7 @@ or `alb_origin` to have the construct build an internal load balancer and serve 
 | `geographic_restriction` | `bool` | `True` | Allowlist GB, JE, GG, IM and IE. | — |
 | `access_logs` | `bool` | `True` | Deliver access logs using standard logging v2. | — |
 | `log_retention_days` | `int` | `90` | Lifecycle expiry on the log bucket. | — |
-| `log_format` | `"w3c" \| "parquet"` | `"w3c"` | Output format for delivered logs. | Type checker only. Cannot be changed in place once deployed. |
+| `log_format` | `"w3c" \| "parquet"` | `"w3c"` | Output format for delivered logs. | Type checker only. Changing it replaces the log delivery. |
 | `price_class` | `PriceClass` | `PRICE_CLASS_100` | The edge locations to serve from. | — |
 | `minimum_protocol_version` | `SecurityPolicyProtocol` | `TLS_V1_2_2021` | Lowest TLS version a viewer may negotiate. | — |
 | `comment` | `str \| None` | `None` | Appended to the resource name in the console's Description column. | CDK silently truncates the combined string at 128 characters. |
@@ -283,8 +283,8 @@ Two things worth knowing:
 
 - `log_format` defaults to `"w3c"`, which matches the legacy CloudFront layout and costs
   nothing extra. `"parquet"` is far cheaper to query in Athena but incurs CloudWatch
-  conversion charges. **It cannot be changed in place.** Set `access_logs=False`, deploy,
-  change the format, then deploy again.
+  conversion charges. Changing it later creates a new delivery before removing the old
+  one, so both formats may land in the bucket briefly during the deploy.
 - Logs can take up to an hour to appear. That is normal, not a broken configuration.
 
 ## Naming

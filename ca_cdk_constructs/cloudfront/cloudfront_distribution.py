@@ -190,8 +190,8 @@ class CloudFrontDistribution(Construct):
         required delivery policy to an imported bucket and the failure would be silent.
     :param log_format: Access log output format. Defaults to "w3c", which matches the
         legacy CloudFront log layout and costs nothing extra. "parquet" is far cheaper to
-        query in Athena but incurs CloudWatch conversion charges. This cannot be changed
-        once deployed without disabling access logs first.
+        query in Athena but incurs CloudWatch conversion charges. Changing it after
+        deployment replaces the delivery destination and the delivery.
     :param price_class: The edge locations to serve from. Defaults to PRICE_CLASS_100.
     :param minimum_protocol_version: Lowest TLS version a viewer may negotiate. Defaults to
         TLS_V1_2_2021, which is the AWS recommended policy and what Security Hub control
@@ -393,6 +393,7 @@ class CloudFrontDistribution(Construct):
                         "logs:DeleteDeliveryDestination",
                         "logs:CreateDelivery",
                         "logs:GetDelivery",
+                        "logs:UpdateDeliveryConfiguration",
                         "logs:DeleteDelivery",
                     ],
                     resources=[
@@ -404,10 +405,6 @@ class CloudFrontDistribution(Construct):
                 PolicyStatement(
                     actions=["cloudfront:AllowVendedLogDeliveryForResource"],
                     resources=[self.distribution.distribution_arn],
-                ),
-                PolicyStatement(
-                    actions=["s3:GetBucketPolicy", "s3:PutBucketPolicy"],
-                    resources=[bucket.bucket_arn],
                 ),
             ]
         )
@@ -468,9 +465,13 @@ class CloudFrontDistribution(Construct):
             install_latest_aws_sdk=False,
         )
 
+        s3_delivery_configuration = {
+            "suffixPath": "{DistributionId}/{yyyy}/{MM}/{dd}",
+            "enableHiveCompatiblePath": True,
+        }
         delivery = AwsCustomResource(
             self,
-            "LogDelivery",
+            f"LogDelivery-{destination_name}",
             on_create=AwsSdkCall(
                 service=LOGS_SDK_CLIENT,
                 action="CreateDelivery",
@@ -480,12 +481,18 @@ class CloudFrontDistribution(Construct):
                     "deliveryDestinationArn": destination.get_response_field(
                         "deliveryDestination.arn"
                     ),
-                    "s3DeliveryConfiguration": {
-                        "suffixPath": "{DistributionId}/{yyyy}/{MM}/{dd}",
-                        "enableHiveCompatiblePath": True,
-                    },
+                    "s3DeliveryConfiguration": s3_delivery_configuration,
                 },
                 physical_resource_id=PhysicalResourceId.from_response("delivery.id"),
+            ),
+            on_update=AwsSdkCall(
+                service=LOGS_SDK_CLIENT,
+                action="UpdateDeliveryConfiguration",
+                region=CLOUDFRONT_HOME_REGION,
+                parameters={
+                    "id": PhysicalResourceIdReference(),
+                    "s3DeliveryConfiguration": s3_delivery_configuration,
+                },
             ),
             on_delete=AwsSdkCall(
                 service=LOGS_SDK_CLIENT,
@@ -497,7 +504,7 @@ class CloudFrontDistribution(Construct):
             policy=policy,
             install_latest_aws_sdk=False,
         )
-        delivery.node.add_dependency(source)
+        delivery.node.add_dependency(source, bucket.policy)
 
         return bucket
 

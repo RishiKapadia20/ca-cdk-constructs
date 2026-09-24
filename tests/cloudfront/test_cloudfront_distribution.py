@@ -377,6 +377,23 @@ def test_log_bucket_policy_grants_the_delivery_principal(standalone):
     )
 
 
+def test_log_format_change_replaces_the_delivery():
+    """A delivery's destination is fixed once created, so a format change has to produce a
+    new delivery rather than send the old one an Update it would silently ignore, leaving
+    it attached to a destination CloudFormation is about to delete.
+
+    Asserts the custom resource logical IDs differ between the two formats.
+    """
+    w3c, parquet = build_stack(), build_stack()
+    build_distribution(w3c, log_format="w3c")
+    build_distribution(parquet, log_format="parquet")
+
+    w3c_ids = set(Template.from_stack(w3c).find_resources("Custom::AWS"))
+    parquet_ids = set(Template.from_stack(parquet).find_resources("Custom::AWS"))
+
+    assert w3c_ids != parquet_ids
+
+
 def test_log_bucket_is_hardened_and_expires_objects():
     """Access logs record what people requested, and CloudFront never deletes them, so the
     bucket has to stay private and must not grow forever.
